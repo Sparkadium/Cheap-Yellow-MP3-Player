@@ -1,6 +1,6 @@
 # ShuffleCYD
 
-An iPod Shuffle-inspired Bluetooth MP3 player built on the ESP32-2432S028 (CYD — Cheap Yellow Display).
+An iPod inspired Bluetooth MP3 player built on the ESP32-2432S028 (CYD — Cheap Yellow Display).
 
 ![ESP32 CYD](https://github.com/sparkadium/ShuffleCYD)
 
