@@ -64,7 +64,7 @@ The "Huge APP" partition is required — the Bluetooth stack + MP3 decoder + TFT
 Edit `ShuffleCYD.ino` and change this line near the top:
 
 ```cpp
-static const char* BT_SPEAKER_NAME = "Anker SoundCore";
+static const char* BT_SPEAKER_NAME = "YOUR SPEAKER NAME HERE";
 ```
 
 Replace with your speaker's exact Bluetooth name (case-sensitive). Check your phone's Bluetooth settings if unsure.
