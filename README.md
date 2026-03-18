@@ -14,3 +14,5 @@ Features: BT audio, spectrum visualizer, progress bar, playlist browser, near-ga
 Libraries: ESP8266Audio, ESP32-A2DP, TFT_eSPI, XPT2046
 
 Partition: "Huge APP (3MB No OTA)"
+
+Copy user_setup.h to Arduino/libraries/TFT_eSPI/
