@@ -17,4 +17,6 @@ Partition: "Huge APP (3MB No OTA)"
 
 Copy user_setup.h to Arduino/libraries/TFT_eSPI/
 
-Consult readme(6) for troubleshooting and more detailed info.
+Colors swapped?	Toggle TFT_BGR / TFT_RGB in User_Setup.h
+
+Consult readme(6) for more troubleshooting and more detailed info.
