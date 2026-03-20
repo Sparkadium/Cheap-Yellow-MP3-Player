@@ -34,7 +34,7 @@
 SPIClass touchSPI(HSPI);
 
 // ── Config ──────────────────────────────────────────────────
-static const char* BT_SPEAKER_NAME = "Anker SoundCore";
+static const char* BT_SPEAKER_NAME = "YOUR SPEAKER NAME HERE";
 
 #define TS_MINX 300
 #define TS_MAXX 3900
