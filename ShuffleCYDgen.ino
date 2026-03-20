@@ -92,8 +92,14 @@ public:
 static char* playlist[MAX_TRACKS];
 static int   trackCount   = 0;
 static int   currentTrack = 0;
-static bool  shuffleMode  = true;
 static int   shuffleOrder[MAX_TRACKS];
+
+// Shuffle: OFF = sequential, TRACKS = random all, ALBUM = random within folder
+enum ShuffleMode { SHUFFLE_OFF, SHUFFLE_TRACKS, SHUFFLE_ALBUM };
+static ShuffleMode shuffleMode = SHUFFLE_TRACKS; // default ON like before
+
+// Color inversion — set true if your CYD shows inverted/negative colors
+static const bool INVERT_DISPLAY = false;
 
 // ── Audio engine ────────────────────────────────────────────
 RingBufOutput     *audioOut  = nullptr;
@@ -115,6 +121,22 @@ ScreenMode screenMode = SCREEN_MAIN;
 int browseScroll = 0;
 int browseItemH = 24;
 int browseVisible = 7;
+
+// Two-level browser: albums → tracks
+enum BrowseLevel { BROWSE_ALBUMS, BROWSE_TRACKS };
+BrowseLevel browseLevel = BROWSE_ALBUMS;
+
+#define MAX_ALBUMS 32
+#define MAX_ALBUM_NAME 48
+static char albumNames[MAX_ALBUMS][MAX_ALBUM_NAME];
+static int albumCount = 0;
+static int browseAlbumIdx = -1; // which album we're viewing tracks for
+static char browseAlbumPath[64]; // e.g. "/Music/AlbumName"
+
+// Tracks within the currently browsed album
+#define MAX_BROWSE_TRACKS 64
+static int browseTrackIndices[MAX_BROWSE_TRACKS]; // indices into playlist[]
+static int browseTrackCount = 0;
 
 // ── Bluetooth ───────────────────────────────────────────────
 BluetoothA2DPSource a2dp;
@@ -194,6 +216,8 @@ uint16_t vizColors[8];
 
 // ── Forward declarations ────────────────────────────────────
 void scanSD();
+void scanAlbums();
+void loadBrowseAlbumTracks(const char* albumName);
 void generateShuffleOrder();
 void startTrack(int index, bool gapless = false);
 void stopTrack();
@@ -243,6 +267,7 @@ void setup() {
   // Display
   tft.init();
   tft.setRotation(1);
+  if (INVERT_DISPLAY) tft.invertDisplay(true);
   tft.fillScreen(COL_BG);
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.setTextSize(2);
@@ -277,12 +302,13 @@ void setup() {
     while (1) delay(1000);
   }
   Serial.printf("[OK] %d tracks\n", trackCount);
+  scanAlbums();
   generateShuffleOrder();
 
   // Decode first track
   tft.setCursor(40, 100);
   tft.print("Decoding...");
-  startTrack(shuffleMode ? shuffleOrder[0] : 0);
+  startTrack((shuffleMode == SHUFFLE_TRACKS) ? shuffleOrder[0] : 0);
 
   // Touch
   touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
@@ -476,6 +502,91 @@ void scanSD() {
   root.close();
 }
 
+/** Extract unique folder names from the flat playlist as "albums". */
+void scanAlbums() {
+  albumCount = 0;
+  for (int i = 0; i < trackCount && albumCount < MAX_ALBUMS; i++) {
+    const char* path = playlist[i];
+    // Find the parent folder: e.g. "/Music/Album/track.mp3" → "/Music/Album"
+    const char* lastSlash = strrchr(path, '/');
+    if (!lastSlash || lastSlash == path) continue; // root-level file, skip for albums
+
+    int folderLen = (int)(lastSlash - path);
+
+    // Extract just the folder display name (last component)
+    // e.g. "/Music/Album" → "Album"
+    const char* folderStart = path;
+    for (int j = folderLen - 1; j >= 0; j--) {
+      if (path[j] == '/') { folderStart = path + j + 1; break; }
+    }
+    int nameLen = (int)(lastSlash - folderStart);
+    if (nameLen <= 0 || nameLen >= MAX_ALBUM_NAME) continue;
+
+    // Check if we already have this album
+    char candidate[MAX_ALBUM_NAME];
+    strncpy(candidate, folderStart, nameLen);
+    candidate[nameLen] = '\0';
+
+    // Skip "System Volume Information" and similar
+    if (strcmp(candidate, "System Volume Information") == 0) continue;
+
+    bool exists = false;
+    for (int a = 0; a < albumCount; a++) {
+      if (strcmp(albumNames[a], candidate) == 0) { exists = true; break; }
+    }
+    if (!exists) {
+      strncpy(albumNames[albumCount], candidate, MAX_ALBUM_NAME - 1);
+      albumNames[albumCount][MAX_ALBUM_NAME - 1] = '\0';
+      albumCount++;
+    }
+  }
+
+  // Also add a "All Tracks" virtual album at the start
+  // (shift everything down)
+  if (albumCount < MAX_ALBUMS - 1) {
+    for (int i = albumCount; i > 0; i--) {
+      strncpy(albumNames[i], albumNames[i-1], MAX_ALBUM_NAME);
+    }
+    strncpy(albumNames[0], "[ All Tracks ]", MAX_ALBUM_NAME);
+    albumCount++;
+  }
+
+  Serial.printf("[OK] %d albums\n", albumCount);
+}
+
+/** Find playlist indices for tracks belonging to a folder name. */
+void loadBrowseAlbumTracks(const char* albumName) {
+  browseTrackCount = 0;
+
+  // "All Tracks" = show everything
+  if (strcmp(albumName, "[ All Tracks ]") == 0) {
+    for (int i = 0; i < trackCount && browseTrackCount < MAX_BROWSE_TRACKS; i++) {
+      browseTrackIndices[browseTrackCount++] = i;
+    }
+    return;
+  }
+
+  for (int i = 0; i < trackCount && browseTrackCount < MAX_BROWSE_TRACKS; i++) {
+    const char* path = playlist[i];
+    // Check if this track's parent folder matches
+    const char* lastSlash = strrchr(path, '/');
+    if (!lastSlash) continue;
+
+    // Walk backwards to find the folder name
+    const char* folderStart = path;
+    int folderLen = (int)(lastSlash - path);
+    for (int j = folderLen - 1; j >= 0; j--) {
+      if (path[j] == '/') { folderStart = path + j + 1; break; }
+    }
+    int nameLen = (int)(lastSlash - folderStart);
+
+    if (nameLen == (int)strlen(albumName) &&
+        strncmp(folderStart, albumName, nameLen) == 0) {
+      browseTrackIndices[browseTrackCount++] = i;
+    }
+  }
+}
+
 // ═════════════════════════════════════════════════════════════
 //  SHUFFLE
 // ═════════════════════════════════════════════════════════════
@@ -493,7 +604,9 @@ void generateShuffleOrder() {
 //  PLAYBACK
 // ═════════════════════════════════════════════════════════════
 int resolveTrack(int index) {
-  return shuffleMode ? shuffleOrder[index % trackCount] : (index % trackCount);
+  // SHUFFLE_TRACKS: use the shuffled order
+  // SHUFFLE_ALBUM / SHUFFLE_OFF: sequential (album shuffle is handled in nextTrack)
+  return (shuffleMode == SHUFFLE_TRACKS) ? shuffleOrder[index % trackCount] : (index % trackCount);
 }
 
 void stopTrack() {
@@ -553,6 +666,33 @@ void startTrack(int index, bool gapless) {
 }
 
 void nextTrack(bool gapless) {
+  if (shuffleMode == SHUFFLE_ALBUM && trackCount > 1) {
+    // Find current track's folder
+    int actual = resolveTrack(currentTrack);
+    const char* curPath = playlist[actual];
+    const char* lastSlash = strrchr(curPath, '/');
+    int folderLen = lastSlash ? (int)(lastSlash - curPath) : 0;
+
+    // Collect indices of tracks in the same folder
+    int sameFolder[MAX_TRACKS];
+    int sameFolderCount = 0;
+    for (int i = 0; i < trackCount && sameFolderCount < MAX_TRACKS; i++) {
+      if (folderLen > 0 && strncmp(playlist[i], curPath, folderLen) == 0 &&
+          playlist[i][folderLen] == '/') {
+        sameFolder[sameFolderCount++] = i;
+      }
+    }
+
+    if (sameFolderCount > 1) {
+      // Pick a random track from same folder, avoid current
+      int pick = random(0, sameFolderCount);
+      if (sameFolder[pick] == actual) pick = (pick + 1) % sameFolderCount;
+      // Find which shuffleOrder index maps to this track
+      // Simplest: just play it directly by its playlist index
+      startTrack(sameFolder[pick], gapless);
+      return;
+    }
+  }
   startTrack(currentTrack + 1, gapless);
 }
 
@@ -727,11 +867,15 @@ void drawTransport() {
 void drawBottomBar() {
   tft.fillRect(0, BAR_Y, 320, 64, COL_BG);
 
-  // Row 1: SHF + Browse button
-  tft.setTextSize(2);
-  tft.setTextColor(shuffleMode ? COL_ACCENT : COL_DIM, COL_BG);
-  tft.setCursor(8, BAR_Y + 4);
-  tft.print("SHF");
+  // Row 1: Shuffle mode + Browse button
+  tft.setTextSize(1);
+  uint16_t shfCol = (shuffleMode != SHUFFLE_OFF) ? COL_ACCENT : COL_DIM;
+  tft.fillRoundRect(4, BAR_Y + 1, 72, 22, 4, COL_BTN);
+  tft.setTextColor(shfCol, COL_BTN);
+  tft.setCursor(8, BAR_Y + 7);
+  if (shuffleMode == SHUFFLE_OFF)    tft.print("SHF: OFF");
+  else if (shuffleMode == SHUFFLE_TRACKS) tft.print("SHF: ALL");
+  else                                tft.print("SHF: ALB");
 
   // Browse button
   tft.fillRoundRect(80, BAR_Y + 1, 80, 22, 4, COL_BTN);
@@ -753,7 +897,7 @@ void drawBottomBar() {
 }
 
 // ═════════════════════════════════════════════════════════════
-//  BROWSE SCREEN
+//  BROWSE SCREEN (two-level: albums → tracks)
 // ═════════════════════════════════════════════════════════════
 void drawBrowseScreen() {
   tft.fillScreen(COL_BG);
@@ -763,14 +907,36 @@ void drawBrowseScreen() {
   tft.setTextColor(COL_TEXT, COL_BROWSE_HDR);
   tft.setTextSize(2);
   tft.setCursor(60, 5);
-  tft.print("Browse");
 
-  // Back button
-  tft.fillRoundRect(4, 3, 50, 20, 4, COL_BTN);
-  tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setTextSize(1);
-  tft.setCursor(12, 9);
-  tft.print("< Back");
+  if (browseLevel == BROWSE_ALBUMS) {
+    tft.print("Albums");
+    // Back → main screen
+    tft.fillRoundRect(4, 3, 50, 20, 4, COL_BTN);
+    tft.setTextColor(COL_TEXT, COL_BTN);
+    tft.setTextSize(1);
+    tft.setCursor(12, 9);
+    tft.print("< Back");
+    // Count
+    tft.setTextColor(COL_DIM, COL_BROWSE_HDR);
+    tft.setCursor(230, 10);
+    tft.printf("%d albums", albumCount);
+  } else {
+    // Show album name in header
+    char hdr[24];
+    strncpy(hdr, albumNames[browseAlbumIdx], 20);
+    hdr[20] = '\0';
+    tft.print(hdr);
+    // Back → album list
+    tft.fillRoundRect(4, 3, 50, 20, 4, COL_BTN);
+    tft.setTextColor(COL_TEXT, COL_BTN);
+    tft.setTextSize(1);
+    tft.setCursor(8, 9);
+    tft.print("< Albs");
+    // Count
+    tft.setTextColor(COL_DIM, COL_BROWSE_HDR);
+    tft.setCursor(230, 10);
+    tft.printf("%d trks", browseTrackCount);
+  }
 
   // Scroll buttons
   tft.fillRoundRect(4, 218, 60, 20, 4, COL_BTN);
@@ -784,53 +950,78 @@ void drawBrowseScreen() {
   tft.setCursor(268, 224);
   tft.print("DOWN");
 
-  // Track counter
-  tft.setTextColor(COL_DIM, COL_BROWSE_HDR);
-  tft.setCursor(240, 10);
-  tft.printf("%d trks", trackCount);
+  // Now playing indicator
+  if (playerState == STATE_PLAYING || playerState == STATE_PAUSED) {
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.setTextSize(1);
+    tft.setCursor(80, 224);
+    tft.print(playerState == STATE_PLAYING ? "> playing" : "|| paused");
+  }
 
   drawBrowseList();
 }
 
 void drawBrowseList() {
   int listY = 28;
-  int listH = 188; // 28 to 216
-
+  int listH = 188;
   tft.fillRect(0, listY, 320, listH, COL_BG);
 
-  for (int i = 0; i < browseVisible && (browseScroll + i) < trackCount; i++) {
-    int idx = browseScroll + i;
-    int actual = shuffleMode ? shuffleOrder[idx] : idx;
-    int y = listY + i * browseItemH;
+  if (browseLevel == BROWSE_ALBUMS) {
+    // Show album folders
+    for (int i = 0; i < browseVisible && (browseScroll + i) < albumCount; i++) {
+      int idx = browseScroll + i;
+      int y = listY + i * browseItemH;
 
-    // Highlight current track
-    bool isCurrent = (actual == resolveTrack(currentTrack));
-    if (isCurrent) {
-      tft.fillRect(0, y, 320, browseItemH - 2, COL_BROWSE_SEL);
-    } else {
       tft.fillRect(0, y, 320, browseItemH - 2, COL_BROWSE_BG);
-    }
+      tft.setTextColor(COL_TEXT, COL_BROWSE_BG);
+      tft.setTextSize(1);
 
-    // Track number
-    tft.setTextColor(COL_DIM, isCurrent ? COL_BROWSE_SEL : COL_BROWSE_BG);
-    tft.setTextSize(1);
-    tft.setCursor(6, y + 7);
-    tft.printf("%02d", idx + 1);
+      // Folder icon hint
+      tft.setTextColor(COL_DIM, COL_BROWSE_BG);
+      tft.setCursor(6, y + 7);
+      tft.print(idx == 0 ? "*" : "#"); // * for All Tracks, # for folders
 
-    // Track name
-    char name[36];
-    getDisplayName(playlist[actual], name, 35);
-    tft.setTextColor(isCurrent ? COL_ACCENT : COL_TEXT,
-                     isCurrent ? COL_BROWSE_SEL : COL_BROWSE_BG);
-    tft.setCursor(28, y + 3);
-    tft.setTextSize(1);
-    tft.print(name);
+      tft.setTextColor(COL_TEXT, COL_BROWSE_BG);
+      tft.setCursor(18, y + 7);
+      tft.print(albumNames[idx]);
 
-    // Playing indicator
-    if (isCurrent && playerState == STATE_PLAYING) {
-      tft.setTextColor(COL_ACCENT, isCurrent ? COL_BROWSE_SEL : COL_BROWSE_BG);
-      tft.setCursor(300, y + 7);
+      tft.setTextColor(COL_DIM, COL_BROWSE_BG);
+      tft.setCursor(298, y + 7);
       tft.print(">");
+    }
+  } else {
+    // Show tracks in selected album
+    for (int i = 0; i < browseVisible && (browseScroll + i) < browseTrackCount; i++) {
+      int idx = browseScroll + i;
+      int playlistIdx = browseTrackIndices[idx];
+      int y = listY + i * browseItemH;
+
+      // Is this the currently playing track?
+      bool isCurrent = (playlistIdx == resolveTrack(currentTrack));
+
+      tft.fillRect(0, y, 320, browseItemH - 2,
+                   isCurrent ? COL_BROWSE_SEL : COL_BROWSE_BG);
+      uint16_t bg = isCurrent ? COL_BROWSE_SEL : COL_BROWSE_BG;
+
+      // Track number
+      tft.setTextColor(COL_DIM, bg);
+      tft.setTextSize(1);
+      tft.setCursor(6, y + 7);
+      tft.printf("%02d", idx + 1);
+
+      // Track name
+      char name[42];
+      getDisplayName(playlist[playlistIdx], name, 41);
+      tft.setTextColor(isCurrent ? COL_ACCENT : COL_TEXT, bg);
+      tft.setCursor(28, y + 3);
+      tft.print(name);
+
+      // Playing indicator
+      if (isCurrent && playerState == STATE_PLAYING) {
+        tft.setTextColor(COL_ACCENT, bg);
+        tft.setCursor(304, y + 7);
+        tft.print(">");
+      }
     }
   }
 }
@@ -862,8 +1053,15 @@ void handleTouchMain() {
   if (ty >= BAR_Y) {
     // Shuffle toggle
     if (tx < 70 && ty < BAR_Y + 26) {
-      shuffleMode = !shuffleMode;
-      if (shuffleMode) generateShuffleOrder();
+      // Cycle shuffle mode
+      if (shuffleMode == SHUFFLE_OFF) {
+        shuffleMode = SHUFFLE_TRACKS;
+        generateShuffleOrder();
+      } else if (shuffleMode == SHUFFLE_TRACKS) {
+        shuffleMode = SHUFFLE_ALBUM;
+      } else {
+        shuffleMode = SHUFFLE_OFF;
+      }
       drawBottomBar();
       return;
     }
@@ -871,6 +1069,7 @@ void handleTouchMain() {
     // Browse button
     if (tx >= 80 && tx < 160 && ty < BAR_Y + 26) {
       screenMode = SCREEN_BROWSE;
+      browseLevel = BROWSE_ALBUMS;
       browseScroll = 0;
       drawBrowseScreen();
       return;
@@ -904,8 +1103,16 @@ void handleTouchBrowse() {
 
   // Back button
   if (ty < 26 && tx < 60) {
-    screenMode = SCREEN_MAIN;
-    drawMainScreen();
+    if (browseLevel == BROWSE_TRACKS) {
+      // Go back to album list
+      browseLevel = BROWSE_ALBUMS;
+      browseScroll = 0;
+      drawBrowseScreen();
+    } else {
+      // Go back to main screen
+      screenMode = SCREEN_MAIN;
+      drawMainScreen();
+    }
     return;
   }
 
@@ -918,21 +1125,37 @@ void handleTouchBrowse() {
 
   // Scroll down
   if (ty >= 218 && tx > 240) {
-    browseScroll = min(trackCount - browseVisible, browseScroll + browseVisible);
+    int maxItems = (browseLevel == BROWSE_ALBUMS) ? albumCount : browseTrackCount;
+    browseScroll = min(maxItems - browseVisible, browseScroll + browseVisible);
     if (browseScroll < 0) browseScroll = 0;
     drawBrowseList();
     return;
   }
 
-  // Tap on track list (y: 28 to 216)
+  // Tap on list (y: 28 to 216)
   if (ty >= 28 && ty < 216) {
     int tapped = (ty - 28) / browseItemH;
     int idx = browseScroll + tapped;
-    if (idx < trackCount) {
-      currentTrack = idx;
-      startTrack(idx);
-      screenMode = SCREEN_MAIN;
-      drawMainScreen();
+
+    if (browseLevel == BROWSE_ALBUMS) {
+      // Tapped an album → show its tracks
+      if (idx < albumCount) {
+        browseAlbumIdx = idx;
+        loadBrowseAlbumTracks(albumNames[idx]);
+        browseLevel = BROWSE_TRACKS;
+        browseScroll = 0;
+        drawBrowseScreen();
+      }
+    } else {
+      // Tapped a track → play it, go to main
+      if (idx < browseTrackCount) {
+        int playlistIdx = browseTrackIndices[idx];
+        // Find this track's position in the playlist for currentTrack
+        currentTrack = playlistIdx;
+        startTrack(playlistIdx);
+        screenMode = SCREEN_MAIN;
+        drawMainScreen();
+      }
     }
     return;
   }
