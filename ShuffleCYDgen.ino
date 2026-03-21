@@ -33,6 +33,11 @@
 
 SPIClass touchSPI(HSPI);
 
+// ── BOOT button (GPIO 0) — press to lock/unlock screen ─────
+#define BOOT_BTN 0
+static bool screenLocked = false;
+static unsigned long lastBootPress = 0;
+
 // ── Config ──────────────────────────────────────────────────
 static const char* BT_SPEAKER_NAME = "YOUR SPEAKER NAME HERE";
 
@@ -113,7 +118,95 @@ AudioType currentType = AUDIO_NONE;
 // ── Player state ────────────────────────────────────────────
 enum PlayerState { STATE_STOPPED, STATE_PLAYING, STATE_PAUSED };
 PlayerState playerState = STATE_STOPPED;
-float volume = 0.7f;
+
+// ── Bluetooth (declared early — needed by volume and LED functions below) ──
+BluetoothA2DPSource a2dp;
+
+// ── Volume (percentage-based, controls both software gain and A2DP HW vol) ──
+static int volumePercent = 70;
+static void applyVolumePercent() {
+  volumePercent = constrain(volumePercent, 0, 100);
+  if (audioOut) audioOut->setGain((float)volumePercent / 100.0f);
+  a2dp.set_volume((int)((volumePercent * 127) / 100));
+}
+
+// ── RGB LED (CYD back LED: R=4, G=16, B=17, active LOW) ────
+#define RGB_LED_RED   4
+#define RGB_LED_GREEN 16
+#define RGB_LED_BLUE  17
+static unsigned long rgbLastMs = 0;
+static bool rgbBlinkPhase = false;
+static bool rgbPrevBt = false;
+static bool rgbPrevPlaying = false;
+
+static void rgbLedInit() {
+  pinMode(RGB_LED_RED, OUTPUT);
+  pinMode(RGB_LED_GREEN, OUTPUT);
+  pinMode(RGB_LED_BLUE, OUTPUT);
+  digitalWrite(RGB_LED_RED, HIGH);
+  digitalWrite(RGB_LED_GREEN, HIGH);
+  digitalWrite(RGB_LED_BLUE, HIGH);
+}
+
+static void rgbLedUpdate() {
+  unsigned long now = millis();
+  bool bt = a2dp.is_connected();
+  bool playing = (playerState == STATE_PLAYING);
+  if (bt != rgbPrevBt || playing != rgbPrevPlaying) {
+    rgbPrevBt = bt; rgbPrevPlaying = playing;
+    rgbLastMs = now; rgbBlinkPhase = false;
+    digitalWrite(RGB_LED_RED, HIGH);
+    digitalWrite(RGB_LED_GREEN, HIGH);
+    digitalWrite(RGB_LED_BLUE, HIGH);
+  }
+  if (bt && playing) {
+    if (now - rgbLastMs >= 450) { rgbLastMs = now; rgbBlinkPhase = !rgbBlinkPhase; }
+    digitalWrite(RGB_LED_RED, HIGH);
+    digitalWrite(RGB_LED_GREEN, rgbBlinkPhase ? LOW : HIGH);
+    digitalWrite(RGB_LED_BLUE, rgbBlinkPhase ? HIGH : LOW);
+  } else if (!bt) {
+    if (now - rgbLastMs >= 280) { rgbLastMs = now; rgbBlinkPhase = !rgbBlinkPhase; }
+    digitalWrite(RGB_LED_GREEN, HIGH);
+    digitalWrite(RGB_LED_RED, rgbBlinkPhase ? LOW : HIGH);
+    digitalWrite(RGB_LED_BLUE, rgbBlinkPhase ? HIGH : LOW);
+  }
+}
+
+// ── Playback timeline (wall-clock based, survives pause/resume) ──
+static unsigned long trackWallStartMs   = 0;
+static unsigned long accumulatedPauseMs = 0;
+static unsigned long pauseBeganMs       = 0;
+static uint32_t      cachedDurationSec  = 0;
+static uint32_t      cachedWavRateHz    = 0;
+
+static uint32_t elapsedPlaybackSec() {
+  if (playerState == STATE_STOPPED || trackWallStartMs == 0) return 0;
+  if (playerState == STATE_PAUSED && pauseBeganMs >= trackWallStartMs)
+    return min(cachedDurationSec, (uint32_t)((pauseBeganMs - trackWallStartMs - accumulatedPauseMs) / 1000ul));
+  if (playerState == STATE_PLAYING)
+    return min(cachedDurationSec, (uint32_t)((millis() - trackWallStartMs - accumulatedPauseMs) / 1000ul));
+  return 0;
+}
+
+static void formatTimeHMS(char* buf, size_t n, uint32_t sec) {
+  uint32_t m = sec / 60u;
+  uint32_t s = sec % 60u;
+  snprintf(buf, n, "%d:%02d", (int)m, (int)s);
+}
+
+/** Pump the decoder during blocking operations to prevent BT audio underruns. */
+static void audioPumpPlayingMax(int maxLoops) {
+  if (playerState != STATE_PLAYING) return;
+  const int target = (RING_SIZE * 3) / 4;
+  int loops = 0;
+  while ((int)rbAvail() < target && loops < maxLoops) {
+    bool ok = false;
+    if (currentType == AUDIO_MP3 && mp3 && mp3->isRunning()) ok = mp3->loop();
+    else if (currentType == AUDIO_WAV && wav && wav->isRunning()) ok = wav->loop();
+    if (!ok) break;
+    loops++;
+  }
+}
 
 // ── Screen state ────────────────────────────────────────────
 enum ScreenMode { SCREEN_MAIN, SCREEN_BROWSE };
@@ -138,8 +231,35 @@ static char browseAlbumPath[64]; // e.g. "/Music/AlbumName"
 static int browseTrackIndices[MAX_BROWSE_TRACKS]; // indices into playlist[]
 static int browseTrackCount = 0;
 
+// ── Bookmarks (audiobook resume) ────────────────────────────
+// Saved to /bookmarks.dat on SD card. One entry per album.
+// Format per line: albumName|trackIndex|byteOffset|totalTracks
+struct Bookmark {
+  char albumName[MAX_ALBUM_NAME];
+  int trackIdx;       // track index within album
+  uint32_t bytePos;   // byte offset in the file
+  int totalTracks;     // total tracks in album (for progress display)
+  bool completed;      // true if all tracks finished
+};
+
+#define MAX_BOOKMARKS 32
+static Bookmark bookmarks[MAX_BOOKMARKS];
+static int bookmarkCount = 0;
+static unsigned long lastBookmarkSaveMs = 0;
+static const char* BOOKMARK_FILE = "/bookmarks.dat";
+
+// Which album is currently playing (for bookmark tracking)
+static char playingAlbumName[MAX_ALBUM_NAME] = {0};
+static int playingAlbumTrackOffset = 0; // index of first track of this album in playlist[]
+
+// Forward declarations for bookmark functions
+void loadBookmarks();
+void saveBookmarks();
+Bookmark* findBookmark(const char* albumName);
+void updateBookmark(const char* albumName, int trackIdx, uint32_t bytePos, int totalTracks, bool completed);
+int getAlbumTrackIndex(); // current track's index within its album
+
 // ── Bluetooth ───────────────────────────────────────────────
-BluetoothA2DPSource a2dp;
 volatile bool btConnected = false;
 unsigned long lastBTCheck = 0;
 bool lastBTState = false;
@@ -252,6 +372,11 @@ void setup() {
   delay(500);
   Serial.println("ShuffleCYD v2 starting...");
 
+  rgbLedInit();
+
+  // BOOT button for screen lock
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+
   // Precompute visualizer gradient colors
   for (int i = 0; i < 8; i++) {
     int r = map(i, 0, 7, 30, 255);
@@ -290,7 +415,7 @@ void setup() {
 
   // Audio output
   audioOut = new RingBufOutput();
-  audioOut->setGain(volume);
+  applyVolumePercent();
 
   // Scan music
   scanSD();
@@ -303,6 +428,7 @@ void setup() {
   }
   Serial.printf("[OK] %d tracks\n", trackCount);
   scanAlbums();
+  loadBookmarks();
   generateShuffleOrder();
 
   // Decode first track
@@ -327,6 +453,7 @@ void setup() {
 
   unsigned long t0 = millis();
   while (!a2dp.is_connected() && millis() - t0 < 15000) {
+    rgbLedUpdate();
     if (playerState == STATE_PLAYING) {
       if (currentType == AUDIO_MP3 && mp3 && mp3->isRunning()) mp3->loop();
       else if (currentType == AUDIO_WAV && wav && wav->isRunning()) wav->loop();
@@ -345,6 +472,8 @@ void setup() {
 //  LOOP
 // ═════════════════════════════════════════════════════════════
 void loop() {
+  rgbLedUpdate();
+
   // ── Feed decoder ──
   if (playerState == STATE_PLAYING) {
     bool decoderAlive = false;
@@ -372,6 +501,17 @@ void loop() {
     } else {
       // Decoder is stopped — wait for ring buffer to drain then advance
       if (rbAvail() < 200) {
+        // Check if this was the last track in the album — mark complete
+        if (playingAlbumName[0] != '\0') {
+          int aIdx = getAlbumTrackIndex();
+          int aTotal = getAlbumTrackCount();
+          if (aIdx >= aTotal - 1) {
+            // Last track of album finished
+            updateBookmark(playingAlbumName, aIdx, 0, aTotal, true);
+            saveBookmarks();
+            Serial.printf("Album \"%s\" completed!\n", playingAlbumName);
+          }
+        }
         Serial.println("Track done, gapless next");
         nextTrack(true);
       }
@@ -381,19 +521,25 @@ void loop() {
   // ── Throttled UI updates ──
   unsigned long now = millis();
 
-  // Visualizer: ~25 FPS
-  if (screenMode == SCREEN_MAIN && playerState == STATE_PLAYING &&
+  // Visualizer: ~25 FPS (skip when screen locked)
+  if (!screenLocked && screenMode == SCREEN_MAIN && playerState == STATE_PLAYING &&
       now - lastVizDraw > 40) {
     lastVizDraw = now;
     computeViz();
     drawVisualizer();
   }
 
-  // Progress bar: ~4 FPS
-  if (screenMode == SCREEN_MAIN && playerState == STATE_PLAYING &&
+  // Progress bar: ~4 FPS (skip when screen locked)
+  if (!screenLocked && screenMode == SCREEN_MAIN && playerState == STATE_PLAYING &&
       now - lastProgDraw > 250) {
     lastProgDraw = now;
     drawProgressBar();
+  }
+
+  // Bookmark auto-save: every 30s while playing
+  if (playerState == STATE_PLAYING && now - lastBookmarkSaveMs > 30000) {
+    lastBookmarkSaveMs = now;
+    saveCurrentBookmark();
   }
 
   // BT check: every 3s
@@ -411,6 +557,31 @@ void loop() {
   static unsigned long lastUI = 0;
   if (now - lastUI < 50) return;
   lastUI = now;
+
+  // ── BOOT button: toggle screen lock ──
+  if (digitalRead(BOOT_BTN) == LOW && now - lastBootPress > 500) {
+    lastBootPress = now;
+    screenLocked = !screenLocked;
+    if (screenLocked) {
+      // Turn off backlight, skip all touch/display
+      digitalWrite(TFT_BL, LOW);
+      Serial.println("Screen locked");
+    } else {
+      // Turn backlight on, redraw
+      digitalWrite(TFT_BL, HIGH);
+      Serial.println("Screen unlocked");
+      if (screenMode == SCREEN_MAIN) drawMainScreen();
+      else drawBrowseScreen();
+    }
+    // Wait for button release
+    while (digitalRead(BOOT_BTN) == LOW) {
+      audioPumpPlayingMax(64);
+      delay(10);
+    }
+  }
+
+  // Skip touch when screen is locked
+  if (screenLocked) return;
 
   if (screenMode == SCREEN_MAIN) handleTouchMain();
   else handleTouchBrowse();
@@ -500,6 +671,18 @@ void scanSD() {
   File root = SD.open("/");
   scanDir(root, 0);
   root.close();
+
+  // Sort playlist by path so tracks within each folder play in order
+  // (FAT32 directory order is not guaranteed alphabetical)
+  for (int i = 0; i < trackCount - 1; i++) {
+    for (int j = 0; j < trackCount - 1 - i; j++) {
+      if (strcmp(playlist[j], playlist[j + 1]) > 0) {
+        char* tmp = playlist[j];
+        playlist[j] = playlist[j + 1];
+        playlist[j + 1] = tmp;
+      }
+    }
+  }
 }
 
 /** Extract unique folder names from the flat playlist as "albums". */
@@ -588,6 +771,144 @@ void loadBrowseAlbumTracks(const char* albumName) {
 }
 
 // ═════════════════════════════════════════════════════════════
+//  BOOKMARKS — audiobook progress saved to SD
+// ═════════════════════════════════════════════════════════════
+void loadBookmarks() {
+  bookmarkCount = 0;
+  File f = SD.open(BOOKMARK_FILE, FILE_READ);
+  if (!f) return;
+
+  while (f.available() && bookmarkCount < MAX_BOOKMARKS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    Bookmark& b = bookmarks[bookmarkCount];
+    // Parse: albumName|trackIdx|bytePos|totalTracks|completed
+    int p1 = line.indexOf('|');
+    if (p1 < 0) continue;
+    int p2 = line.indexOf('|', p1 + 1);
+    if (p2 < 0) continue;
+    int p3 = line.indexOf('|', p2 + 1);
+    if (p3 < 0) continue;
+    int p4 = line.indexOf('|', p3 + 1);
+
+    String name = line.substring(0, p1);
+    strncpy(b.albumName, name.c_str(), MAX_ALBUM_NAME - 1);
+    b.albumName[MAX_ALBUM_NAME - 1] = '\0';
+    b.trackIdx = line.substring(p1 + 1, p2).toInt();
+    b.bytePos = (uint32_t)line.substring(p2 + 1, p3).toInt();
+    b.totalTracks = line.substring(p3 + 1, p4 > 0 ? p4 : line.length()).toInt();
+    b.completed = (p4 > 0) ? (line.substring(p4 + 1).toInt() != 0) : false;
+
+    bookmarkCount++;
+  }
+  f.close();
+  Serial.printf("[OK] Loaded %d bookmarks\n", bookmarkCount);
+}
+
+void saveBookmarks() {
+  File f = SD.open(BOOKMARK_FILE, FILE_WRITE);
+  if (!f) { Serial.println("[ERR] Can't write bookmarks"); return; }
+
+  for (int i = 0; i < bookmarkCount; i++) {
+    Bookmark& b = bookmarks[i];
+    f.printf("%s|%d|%lu|%d|%d\n", b.albumName, b.trackIdx,
+            (unsigned long)b.bytePos, b.totalTracks, b.completed ? 1 : 0);
+  }
+  f.close();
+}
+
+Bookmark* findBookmark(const char* albumName) {
+  for (int i = 0; i < bookmarkCount; i++) {
+    if (strcmp(bookmarks[i].albumName, albumName) == 0) return &bookmarks[i];
+  }
+  return nullptr;
+}
+
+void updateBookmark(const char* albumName, int trackIdx, uint32_t bytePos, int totalTracks, bool completed) {
+  Bookmark* b = findBookmark(albumName);
+  if (!b) {
+    if (bookmarkCount >= MAX_BOOKMARKS) return; // full
+    b = &bookmarks[bookmarkCount++];
+    strncpy(b->albumName, albumName, MAX_ALBUM_NAME - 1);
+    b->albumName[MAX_ALBUM_NAME - 1] = '\0';
+  }
+  b->trackIdx = trackIdx;
+  b->bytePos = bytePos;
+  b->totalTracks = totalTracks;
+  b->completed = completed;
+}
+
+/** Figure out current track's index within its album folder. */
+int getAlbumTrackIndex() {
+  if (playingAlbumName[0] == '\0' || trackCount == 0) return 0;
+
+  // Count how many tracks before currentTrack belong to the same album
+  int actual = resolveTrack(currentTrack);
+  const char* curPath = playlist[actual];
+  const char* lastSlash = strrchr(curPath, '/');
+  if (!lastSlash) return 0;
+  int folderLen = (int)(lastSlash - curPath);
+
+  int albumIdx = 0;
+  for (int i = 0; i < trackCount; i++) {
+    if (strncmp(playlist[i], curPath, folderLen) == 0 && playlist[i][folderLen] == '/') {
+      if (i == actual) return albumIdx;
+      albumIdx++;
+    }
+  }
+  return 0;
+}
+
+/** Count total tracks in the same folder as the current track. */
+int getAlbumTrackCount() {
+  int actual = resolveTrack(currentTrack);
+  const char* curPath = playlist[actual];
+  const char* lastSlash = strrchr(curPath, '/');
+  if (!lastSlash) return 1;
+  int folderLen = (int)(lastSlash - curPath);
+
+  int count = 0;
+  for (int i = 0; i < trackCount; i++) {
+    if (strncmp(playlist[i], curPath, folderLen) == 0 && playlist[i][folderLen] == '/')
+      count++;
+  }
+  return count;
+}
+
+/** Save current playback position as a bookmark. */
+void saveCurrentBookmark() {
+  if (playingAlbumName[0] == '\0') return;
+  if (playerState == STATE_STOPPED) return;
+
+  uint32_t pos = audioFile ? audioFile->getPos() : 0;
+  int aIdx = getAlbumTrackIndex();
+  int aTotal = getAlbumTrackCount();
+
+  updateBookmark(playingAlbumName, aIdx, pos, aTotal, false);
+  saveBookmarks();
+}
+
+/** Extract album name from a playlist path for bookmark tracking. */
+void setPlayingAlbumFromPath(const char* path) {
+  const char* lastSlash = strrchr(path, '/');
+  if (!lastSlash || lastSlash == path) {
+    playingAlbumName[0] = '\0';
+    return;
+  }
+  int folderLen = (int)(lastSlash - path);
+  const char* folderStart = path;
+  for (int j = folderLen - 1; j >= 0; j--) {
+    if (path[j] == '/') { folderStart = path + j + 1; break; }
+  }
+  int nameLen = (int)(lastSlash - folderStart);
+  if (nameLen <= 0 || nameLen >= MAX_ALBUM_NAME) { playingAlbumName[0] = '\0'; return; }
+  strncpy(playingAlbumName, folderStart, nameLen);
+  playingAlbumName[nameLen] = '\0';
+}
+
+// ═════════════════════════════════════════════════════════════
 //  SHUFFLE
 // ═════════════════════════════════════════════════════════════
 void generateShuffleOrder() {
@@ -618,7 +939,15 @@ void stopTrack() {
   currentType = AUDIO_NONE;
 }
 
+// Seek target for resume — set before calling startTrack, 0 = no seek
+static uint32_t resumeSeekPos = 0;
+
 void startTrack(int index, bool gapless) {
+  // Save bookmark for the track we're leaving
+  if (playerState == STATE_PLAYING || playerState == STATE_PAUSED) {
+    saveCurrentBookmark();
+  }
+
   stopTrack();
 
   // For gapless: don't flush ring buffer, let remaining audio drain
@@ -632,6 +961,9 @@ void startTrack(int index, bool gapless) {
   const char* path = playlist[actual];
   Serial.printf("Playing [%d]: %s%s\n", actual, path, gapless ? " (gapless)" : "");
 
+  // Track which album is playing for bookmarks
+  setPlayingAlbumFromPath(path);
+
   audioFile = new AudioFileSourceSD(path);
 
   if (isWAV(path)) {
@@ -644,7 +976,25 @@ void startTrack(int index, bool gapless) {
     currentType = AUDIO_MP3;
   }
 
+  // Seek to resume position if set
+  if (resumeSeekPos > 0 && audioFile) {
+    Serial.printf("Resuming at byte %lu\n", (unsigned long)resumeSeekPos);
+    audioFile->seek(resumeSeekPos, SEEK_SET);
+    resumeSeekPos = 0;
+  }
+
   playerState = STATE_PLAYING;
+
+  // Init playback timing
+  trackWallStartMs = millis();
+  accumulatedPauseMs = 0;
+  pauseBeganMs = 0;
+  cachedWavRateHz = 0;
+  cachedDurationSec = 0;
+  if (currentType == AUDIO_MP3 && audioFile) {
+    uint32_t sz = audioFile->getSize();
+    cachedDurationSec = (sz > 0) ? (sz / 16000u) : 0; // ~128kbps estimate
+  }
 
   // Pre-fill buffer (less aggressively for gapless since buffer has data)
   int target = gapless ? RING_SIZE / 4 : RING_SIZE / 2;
@@ -701,8 +1051,17 @@ void prevTrack() {
 }
 
 void togglePause() {
-  if (playerState == STATE_PLAYING) playerState = STATE_PAUSED;
-  else if (playerState == STATE_PAUSED) playerState = STATE_PLAYING;
+  if (playerState == STATE_PLAYING) {
+    playerState = STATE_PAUSED;
+    pauseBeganMs = millis();
+    saveCurrentBookmark();
+  } else if (playerState == STATE_PAUSED) {
+    if (pauseBeganMs) {
+      accumulatedPauseMs += (millis() - pauseBeganMs);
+      pauseBeganMs = 0;
+    }
+    playerState = STATE_PLAYING;
+  }
   if (screenMode == SCREEN_MAIN) drawTransport();
 }
 
@@ -727,11 +1086,14 @@ void formatTime(int seconds, char* buf) {
 void drawMainScreen() {
   tft.fillScreen(COL_BG);
   drawTopBar();
+  audioPumpPlayingMax(128);
   drawTrackName();
   drawVisualizer();
+  audioPumpPlayingMax(128);
   drawProgressBar();
   drawTransport();
   drawBottomBar();
+  audioPumpPlayingMax(256);
 }
 
 void drawTopBar() {
@@ -805,37 +1167,32 @@ void drawProgressBar() {
   int barH = 6;
   int barY = PROG_Y + 6;
 
-  float prog = getProgress();
-
-  // Time display
   tft.fillRect(0, PROG_Y, 320, PROG_H, COL_BG);
   tft.setTextSize(1);
   tft.setTextColor(COL_DIM, COL_BG);
 
-  if (audioFile) {
-    uint32_t sz = audioFile->getSize();
-    // Estimate time from bitrate (128kbps = 16000 bytes/sec)
-    int totalSec = sz / 16000;
-    int elapsedSec = (int)(prog * totalSec);
-    char eBuf[8], tBuf[8];
-    formatTime(elapsedSec, eBuf);
-    formatTime(totalSec, tBuf);
-    tft.setCursor(4, PROG_Y + 3);
-    tft.print(eBuf);
-    tft.setCursor(280, PROG_Y + 3);
-    tft.print(tBuf);
+  uint32_t el = elapsedPlaybackSec();
+  float prog = 0;
+
+  char eBuf[12], tBuf[12];
+  formatTimeHMS(eBuf, sizeof(eBuf), el);
+  if (cachedDurationSec > 0) {
+    formatTimeHMS(tBuf, sizeof(tBuf), cachedDurationSec);
+    prog = (float)el / (float)cachedDurationSec;
+    if (prog > 1.0f) prog = 1.0f;
+  } else {
+    strncpy(tBuf, "--:--", sizeof(tBuf));
   }
 
-  // Bar background
+  tft.setCursor(4, PROG_Y + 3);
+  tft.print(eBuf);
+  tft.setCursor(280, PROG_Y + 3);
+  tft.print(tBuf);
+
+  // Bar
   tft.fillRoundRect(barX, barY, barW, barH, 2, COL_PROG_BG);
-
-  // Bar fill
   int fillW = (int)(barW * prog);
-  if (fillW > 0) {
-    tft.fillRoundRect(barX, barY, fillW, barH, 2, COL_PROG_FG);
-  }
-
-  // Position dot
+  if (fillW > 0) tft.fillRoundRect(barX, barY, fillW, barH, 2, COL_PROG_FG);
   int dotX = barX + fillW;
   tft.fillCircle(constrain(dotX, barX, barX + barW), barY + barH / 2, 4, COL_ACCENT);
 }
@@ -884,16 +1241,28 @@ void drawBottomBar() {
   tft.setCursor(97, BAR_Y + 7);
   tft.print("BROWSE");
 
-  // Row 2: Volume bar
-  int vx = 8, vw = 304, vy = BAR_Y + 30, vh = 12;
+  // Row 2: Volume +/- buttons
+  tft.fillRoundRect(8, BAR_Y + 28, 60, 22, 4, COL_BTN);
+  tft.setTextColor(COL_TEXT, COL_BTN);
+  tft.setTextSize(2);
+  tft.setCursor(28, BAR_Y + 32);
+  tft.print("-");
+
+  tft.fillRoundRect(252, BAR_Y + 28, 60, 22, 4, COL_BTN);
+  tft.setTextColor(COL_TEXT, COL_BTN);
+  tft.setCursor(272, BAR_Y + 32);
+  tft.print("+");
+
+  // Volume bar (center, display only)
+  int vx = 76, vw = 168, vy = BAR_Y + 32, vh = 14;
   tft.fillRoundRect(vx, vy, vw, vh, 3, COL_VOL_BG);
-  int fw = (int)(vw * volume);
+  int fw = (int)(vw * volumePercent / 100);
   if (fw > 0) tft.fillRoundRect(vx, vy, fw, vh, 3, COL_VOL_FG);
 
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setTextSize(1);
-  tft.setCursor(vx, BAR_Y + 46);
-  tft.printf("Vol: %d%%", (int)(volume * 100));
+  tft.setCursor(140, BAR_Y + 50);
+  tft.printf("Vol: %d%%", volumePercent);
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -936,6 +1305,16 @@ void drawBrowseScreen() {
     tft.setTextColor(COL_DIM, COL_BROWSE_HDR);
     tft.setCursor(230, 10);
     tft.printf("%d trks", browseTrackCount);
+
+    // Resume button if bookmark exists
+    Bookmark* bm = (browseAlbumIdx > 0) ? findBookmark(albumNames[browseAlbumIdx]) : nullptr;
+    if (bm && !bm->completed && bm->trackIdx < browseTrackCount) {
+      tft.fillRoundRect(80, 218, 160, 20, 4, tft.color565(50, 80, 50));
+      tft.setTextColor(COL_ACCENT, tft.color565(50, 80, 50));
+      tft.setTextSize(1);
+      tft.setCursor(92, 224);
+      tft.printf("RESUME (trk %d)", bm->trackIdx + 1);
+    }
   }
 
   // Scroll buttons
@@ -959,6 +1338,7 @@ void drawBrowseScreen() {
   }
 
   drawBrowseList();
+  audioPumpPlayingMax(384);
 }
 
 void drawBrowseList() {
@@ -967,26 +1347,45 @@ void drawBrowseList() {
   tft.fillRect(0, listY, 320, listH, COL_BG);
 
   if (browseLevel == BROWSE_ALBUMS) {
-    // Show album folders
+    // Show album folders with progress
     for (int i = 0; i < browseVisible && (browseScroll + i) < albumCount; i++) {
       int idx = browseScroll + i;
       int y = listY + i * browseItemH;
 
       tft.fillRect(0, y, 320, browseItemH - 2, COL_BROWSE_BG);
-      tft.setTextColor(COL_TEXT, COL_BROWSE_BG);
       tft.setTextSize(1);
 
-      // Folder icon hint
+      // Folder icon
       tft.setTextColor(COL_DIM, COL_BROWSE_BG);
       tft.setCursor(6, y + 7);
-      tft.print(idx == 0 ? "*" : "#"); // * for All Tracks, # for folders
+      tft.print(idx == 0 ? "*" : "#");
 
+      // Album name
       tft.setTextColor(COL_TEXT, COL_BROWSE_BG);
       tft.setCursor(18, y + 7);
       tft.print(albumNames[idx]);
 
+      // Show bookmark progress (skip "All Tracks" entry)
+      if (idx > 0) {
+        Bookmark* bm = findBookmark(albumNames[idx]);
+        if (bm) {
+          tft.setCursor(248, y + 7);
+          if (bm->completed) {
+            tft.setTextColor(COL_ACCENT, COL_BROWSE_BG);
+            tft.print("Done");
+          } else {
+            tft.setTextColor(tft.color565(180, 180, 80), COL_BROWSE_BG);
+            tft.printf("%d/%d", bm->trackIdx + 1, bm->totalTracks);
+          }
+        } else {
+          tft.setTextColor(COL_DIM, COL_BROWSE_BG);
+          tft.setCursor(268, y + 7);
+          tft.print("New");
+        }
+      }
+
       tft.setTextColor(COL_DIM, COL_BROWSE_BG);
-      tft.setCursor(298, y + 7);
+      tft.setCursor(304, y + 7);
       tft.print(">");
     }
   } else {
@@ -1075,12 +1474,17 @@ void handleTouchMain() {
       return;
     }
 
-    // Volume bar (row 2)
+    // Volume -/+ (row 2)
     if (ty >= BAR_Y + 28) {
-      float nv = (float)(tx - 8) / 304.0f;
-      volume = constrain(nv, 0.0f, 1.0f);
-      audioOut->setGain(volume);
-      drawBottomBar();
+      if (tx < 80) {
+        volumePercent -= 10;
+        applyVolumePercent();
+        drawBottomBar();
+      } else if (tx >= 240) {
+        volumePercent += 10;
+        applyVolumePercent();
+        drawBottomBar();
+      }
       return;
     }
   }
@@ -1132,6 +1536,20 @@ void handleTouchBrowse() {
     return;
   }
 
+  // Resume button (center of bottom bar, only in track view)
+  if (ty >= 218 && tx >= 80 && tx <= 240 && browseLevel == BROWSE_TRACKS) {
+    Bookmark* bm = (browseAlbumIdx > 0) ? findBookmark(albumNames[browseAlbumIdx]) : nullptr;
+    if (bm && !bm->completed && bm->trackIdx < browseTrackCount) {
+      int playlistIdx = browseTrackIndices[bm->trackIdx];
+      currentTrack = playlistIdx;
+      resumeSeekPos = bm->bytePos;
+      startTrack(playlistIdx);
+      screenMode = SCREEN_MAIN;
+      drawMainScreen();
+    }
+    return;
+  }
+
   // Tap on list (y: 28 to 216)
   if (ty >= 28 && ty < 216) {
     int tapped = (ty - 28) / browseItemH;
@@ -1143,15 +1561,21 @@ void handleTouchBrowse() {
         browseAlbumIdx = idx;
         loadBrowseAlbumTracks(albumNames[idx]);
         browseLevel = BROWSE_TRACKS;
-        browseScroll = 0;
+        // Auto-scroll to bookmarked track if available
+        Bookmark* bm = (idx > 0) ? findBookmark(albumNames[idx]) : nullptr;
+        if (bm && !bm->completed && bm->trackIdx < browseTrackCount) {
+          browseScroll = max(0, bm->trackIdx - 2); // show bookmark in context
+        } else {
+          browseScroll = 0;
+        }
         drawBrowseScreen();
       }
     } else {
       // Tapped a track → play it, go to main
       if (idx < browseTrackCount) {
         int playlistIdx = browseTrackIndices[idx];
-        // Find this track's position in the playlist for currentTrack
         currentTrack = playlistIdx;
+        resumeSeekPos = 0; // start from beginning when tapping explicitly
         startTrack(playlistIdx);
         screenMode = SCREEN_MAIN;
         drawMainScreen();
