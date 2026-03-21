@@ -12,6 +12,7 @@ A Bluetooth MP3 player built on the ESP32-2432S028 (CYD — Cheap Yellow Display
 - **Three Shuffle Modes** — Off / All Tracks / Within Album folder
 - **Touch Volume Control** — full-width slider
 - **Background Playback** — music keeps playing while browsing albums
+- **Toggle Screen On/Off** - boot button toggles the touch and display on/off for pocket carrying/better battery life
 
 ## Hardware
 
